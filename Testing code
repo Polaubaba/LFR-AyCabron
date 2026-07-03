@@ -1,0 +1,402 @@
+"""
+Line Follower Robot - Sensor Dashboard + Menu System
+======================================================
+Hardware:
+  I2C (OLED + MPU6050):
+    SCL = GP6
+    SDA = GP7
+  Buttons (active-low, internal pull-up):
+    UP    = GP0
+    DOWN  = GP1
+    ENTER = GP2
+  Line Follower Sensors (8x digital, active-high modules):
+    S1..S8 = GP16, GP17, GP18, GP19, GP20, GP21, GP26, GP27
+  IR Enable (drives sensor array's IR emitters, held HIGH):
+    IR_EN = GP22
+  Buzzer (active buzzer, digital drive):
+    BUZZER = GP28   <-- pin not specified by user, change if needed
+
+Menu:
+  MAIN MENU
+   > Sensor Data (All)
+     MPU Only
+     OLED Animation
+     LFR Sensors
+     Trigger Buzzer
+
+  UP / DOWN   -> move selection in Main Menu
+  ENTER       -> confirm selection / go back to Main Menu from any sub-screen
+  (In "Trigger Buzzer" screen: UP = beep, ENTER = back to Main Menu)
+"""
+
+import time
+import board
+import busio
+import digitalio
+import displayio
+import terminalio
+import adafruit_displayio_ssd1306
+from adafruit_display_text import label
+import adafruit_mpu6050
+
+# ----------------------------
+# Release previous displays
+# ----------------------------
+displayio.release_displays()
+
+# ----------------------------
+# I2C Bus
+# ----------------------------
+i2c = busio.I2C(scl=board.GP7, sda=board.GP6)
+
+while not i2c.try_lock():
+    pass
+print("Scanning I2C...")
+devices = i2c.scan()
+print("Found:", [hex(d) for d in devices])
+i2c.unlock()
+
+# ----------------------------
+# OLED Setup
+# ----------------------------
+display_bus = displayio.I2CDisplay(i2c, device_address=0x3C)
+WIDTH = 128
+HEIGHT = 64
+display = adafruit_displayio_ssd1306.SSD1306(display_bus, width=WIDTH, height=HEIGHT)
+
+# ----------------------------
+# MPU6050 Setup
+# ----------------------------
+mpu = adafruit_mpu6050.MPU6050(i2c)
+
+# ----------------------------
+# Buttons
+# ----------------------------
+def make_button(pin):
+    b = digitalio.DigitalInOut(pin)
+    b.direction = digitalio.Direction.INPUT
+    b.pull = digitalio.Pull.UP
+    return b
+
+btn_up = make_button(board.GP0)
+btn_down = make_button(board.GP3)
+btn_enter = make_button(board.GP2)
+
+
+class DebouncedButton:
+    """Edge-triggered, debounced push button (active-low)."""
+
+    def __init__(self, pin, debounce_s=0.15):
+        self.pin = pin
+        self.debounce_s = debounce_s
+        self.last_state = True  # not pressed (pulled up)
+        self.last_change = time.monotonic()
+        self.stable_state = True
+
+    def update(self):
+        raw = self.pin.value
+        now = time.monotonic()
+        if raw != self.last_state:
+            self.last_change = now
+            self.last_state = raw
+        if (now - self.last_change) > self.debounce_s:
+            self.stable_state = raw
+
+    def pressed(self):
+        """Returns True once per press (falling edge)."""
+        self.update()
+        was_pressed = (not self.stable_state)
+        if was_pressed and not self._prev_pressed:
+            self._prev_pressed = True
+            return True
+        if not was_pressed:
+            self._prev_pressed = False
+        return False
+
+    _prev_pressed = False
+
+
+up = DebouncedButton(btn_up)
+down = DebouncedButton(btn_down)
+enter = DebouncedButton(btn_enter)
+
+# ----------------------------
+# Line Follower Sensors (8x digital)
+# ----------------------------
+LFR_PINS = [board.GP16, board.GP17, board.GP18, board.GP19,
+            board.GP20, board.GP21, board.GP26, board.GP27]
+
+lfr_sensors = []
+for p in LFR_PINS:
+    s = digitalio.DigitalInOut(p)
+    s.direction = digitalio.Direction.INPUT
+    lfr_sensors.append(s)
+
+
+def read_lfr():
+    return [1 if s.value else 0 for s in lfr_sensors]
+
+
+# ----------------------------
+# IR Enable (powers the line sensor array's IR emitters)
+# ----------------------------
+ir_enable = digitalio.DigitalInOut(board.GP22)
+ir_enable.direction = digitalio.Direction.OUTPUT
+ir_enable.value = True  # held HIGH to keep IR emitters on
+
+# ----------------------------
+# Buzzer
+# ----------------------------
+buzzer = digitalio.DigitalInOut(board.GP28)
+buzzer.direction = digitalio.Direction.OUTPUT
+buzzer.value = False
+
+
+def beep(duration=0.15, times=1, gap=0.1):
+    for _ in range(times):
+        buzzer.value = True
+        time.sleep(duration)
+        buzzer.value = False
+        if times > 1:
+            time.sleep(gap)
+
+
+# ----------------------------
+# Display Groups
+# ----------------------------
+# -- Menu group --
+menu_group = displayio.Group()
+menu_label = label.Label(
+    terminalio.FONT,
+    text="",
+    color=0xFFFFFF,
+    line_spacing=0.85,
+    anchor_point=(0, 0),
+    anchored_position=(0, 0),
+)
+menu_group.append(menu_label)
+
+# -- Text content group (reused for sensor screens) --
+content_group = displayio.Group()
+content_label = label.Label(
+    terminalio.FONT,
+    text="",
+    color=0xFFFFFF,
+    line_spacing=0.85,
+    anchor_point=(0, 0),
+    anchored_position=(0, 0),
+)
+content_group.append(content_label)
+
+# -- Animation group (bitmap-based) --
+anim_bitmap = displayio.Bitmap(WIDTH, HEIGHT, 2)
+anim_palette = displayio.Palette(2)
+anim_palette[0] = 0x000000
+anim_palette[1] = 0xFFFFFF
+anim_tilegrid = displayio.TileGrid(anim_bitmap, pixel_shader=anim_palette)
+anim_group = displayio.Group()
+anim_group.append(anim_tilegrid)
+
+display.root_group = menu_group
+
+# ----------------------------
+# Menu State Machine
+# ----------------------------
+STATE_MENU = "MENU"
+STATE_SENSOR_ALL = "SENSOR_ALL"
+STATE_MPU_ONLY = "MPU_ONLY"
+STATE_ANIMATION = "ANIMATION"
+STATE_LFR = "LFR"
+STATE_BUZZER = "BUZZER"
+
+MENU_ITEMS = [
+    ("Sensor Data (All)", STATE_SENSOR_ALL),
+    ("MPU Only", STATE_MPU_ONLY),
+    ("OLED Animation", STATE_ANIMATION),
+    ("LFR Sensors", STATE_LFR),
+    ("Trigger Buzzer", STATE_BUZZER),
+]
+
+selected_index = 0
+current_state = STATE_MENU
+
+# Animation state (bouncing square)
+anim_x, anim_y = 10.0, 10.0
+anim_vx, anim_vy = 40.0, 30.0  # px/sec
+anim_size = 8
+last_anim_time = time.monotonic()
+
+
+def draw_menu():
+    lines = ["MAIN MENU", ""]
+    for i, (name, _) in enumerate(MENU_ITEMS):
+        marker = ">" if i == selected_index else " "
+        lines.append("{} {}".format(marker, name))
+    menu_label.text = "\n".join(lines)
+    display.root_group = menu_group
+
+
+def enter_state(new_state):
+    global current_state
+    current_state = new_state
+    if new_state == STATE_ANIMATION:
+        display.root_group = anim_group
+    elif new_state == STATE_MENU:
+        draw_menu()
+    else:
+        display.root_group = content_group
+
+
+def update_menu():
+    global selected_index
+    if up.pressed():
+        selected_index = (selected_index - 1) % len(MENU_ITEMS)
+        draw_menu()
+    elif down.pressed():
+        selected_index = (selected_index + 1) % len(MENU_ITEMS)
+        draw_menu()
+    elif enter.pressed():
+        _, target_state = MENU_ITEMS[selected_index]
+        enter_state(target_state)
+
+
+def check_back_to_menu():
+    """Common 'ENTER = back to Main Menu' behavior for sub-screens."""
+    if enter.pressed():
+        enter_state(STATE_MENU)
+        return True
+    return False
+
+
+def update_sensor_all():
+    if check_back_to_menu():
+        return
+    ax, ay, az = mpu.acceleration
+    gx, gy, gz = mpu.gyro
+    temp = mpu.temperature
+    lfr = read_lfr()
+
+    print("---------------------------")
+    print("Acceleration X:%.2f Y:%.2f Z:%.2f" % (ax, ay, az))
+    print("Gyroscope     X:%.2f Y:%.2f Z:%.2f" % (gx, gy, gz))
+    print("Temperature: %.2f C" % temp)
+    print("LFR:", lfr)
+
+    content_label.text = (
+        "ALL SENSORS  [ENT=back]\n"
+        "AX{:5.1f} AY{:5.1f}\n"
+        "AZ{:5.1f} T{:4.1f}C\n"
+        "GX{:5.1f} GY{:5.1f}\n"
+        "LFR:{}".format(ax, ay, az, temp, gx, gy, "".join(str(v) for v in lfr))
+    )
+    time.sleep(0.1)
+
+
+def update_mpu_only():
+    if check_back_to_menu():
+        return
+    ax, ay, az = mpu.acceleration
+    gx, gy, gz = mpu.gyro
+    temp = mpu.temperature
+
+    print("---------------------------")
+    print("Acceleration")
+    print("X: %.2f" % ax)
+    print("Y: %.2f" % ay)
+    print("Z: %.2f" % az)
+    print("Gyroscope")
+    print("X: %.2f" % gx)
+    print("Y: %.2f" % gy)
+    print("Z: %.2f" % gz)
+    print("Temperature: %.2f C" % temp)
+
+    content_label.text = (
+        "MPU ONLY   [ENT=back]\n"
+        "ACC X:{:5.1f}\n"
+        "    Y:{:5.1f}\n"
+        "    Z:{:5.1f}\n"
+        "GYR X:{:5.1f} Y:{:5.1f}\n"
+        "T:{:4.1f}C".format(ax, ay, az, gx, gy, temp)
+    )
+    time.sleep(0.15)
+
+
+def update_lfr():
+    if check_back_to_menu():
+        return
+    lfr = read_lfr()
+    print("LFR:", lfr)
+    bar = ""
+    for v in lfr:
+        bar += "#" if v else "."
+    content_label.text = (
+        "LFR SENSORS [ENT=back]\n\n"
+        "S1 S2 S3 S4 S5 S6 S7 S8\n"
+        "{} {} {} {} {} {} {} {}\n\n"
+        "{}".format(*lfr, bar)
+    )
+    time.sleep(0.1)
+
+
+def update_buzzer():
+    content_label.text = (
+        "BUZZER TEST\n\n"
+        "UP    = beep\n"
+        "ENTER = back\n"
+    )
+    if check_back_to_menu():
+        return
+    if up.pressed():
+        beep(duration=0.15, times=1)
+
+
+def update_animation():
+    global anim_x, anim_y, anim_vx, anim_vy, last_anim_time
+    if check_back_to_menu():
+        return
+
+    now = time.monotonic()
+    dt = now - last_anim_time
+    last_anim_time = now
+
+    anim_x += anim_vx * dt
+    anim_y += anim_vy * dt
+
+    if anim_x <= 0 or anim_x + anim_size >= WIDTH:
+        anim_vx = -anim_vx
+        anim_x = max(0, min(anim_x, WIDTH - anim_size))
+    if anim_y <= 0 or anim_y + anim_size >= HEIGHT:
+        anim_vy = -anim_vy
+        anim_y = max(0, min(anim_y, HEIGHT - anim_size))
+
+    anim_bitmap.fill(0)
+    x0, y0 = int(anim_x), int(anim_y)
+    for i in range(anim_size):
+        for j in range(anim_size):
+            px, py = x0 + i, y0 + j
+            if 0 <= px < WIDTH and 0 <= py < HEIGHT:
+                anim_bitmap[px, py] = 1
+
+
+# ----------------------------
+# Boot beep + initial menu draw
+# ----------------------------
+beep(duration=0.08, times=2, gap=0.06)
+draw_menu()
+
+# ----------------------------
+# Main Loop
+# ----------------------------
+while True:
+    if current_state == STATE_MENU:
+        update_menu()
+    elif current_state == STATE_SENSOR_ALL:
+        update_sensor_all()
+    elif current_state == STATE_MPU_ONLY:
+        update_mpu_only()
+    elif current_state == STATE_ANIMATION:
+        update_animation()
+    elif current_state == STATE_LFR:
+        update_lfr()
+    elif current_state == STATE_BUZZER:
+        update_buzzer()
